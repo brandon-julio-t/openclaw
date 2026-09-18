@@ -886,7 +886,7 @@ async function runSharedClientRestartTest(
   ]);
   readyClient.notify({
     method: "turn/completed",
-    params: { threadId: "thread-existing", turn: { id: "turn-1", status: "completed" } },
+    params: { threadId: "thread-existing", turn: { id: "turn-1", status: "completed", items: [] } },
   });
   const result = await run;
   return { result, requests, client: readyClient.client };
@@ -5966,7 +5966,7 @@ describe("runCodexAppServerAttempt", () => {
                 params: {
                   threadId: "thread-existing",
                   turnId: "compact-turn",
-                  turn: { id: "compact-turn", status: "completed" },
+                  turn: { id: "compact-turn", status: "completed", items: [] },
                 },
               });
             });
@@ -6052,7 +6052,7 @@ describe("runCodexAppServerAttempt", () => {
       method: "turn/completed",
       params: {
         threadId: "thread-existing",
-        turn: { id: "stale-turn", status: "completed" },
+        turn: { id: "stale-turn", status: "completed", items: [] },
       },
     });
     expect(harness.requests.map((request) => request.method)).not.toContain("turn/start");
@@ -6070,7 +6070,7 @@ describe("runCodexAppServerAttempt", () => {
       method: "turn/completed",
       params: {
         threadId: "thread-existing",
-        turn: { id: "compact-turn", status: "completed" },
+        turn: { id: "compact-turn", status: "completed", items: [] },
       },
     });
     await harness.waitForMethod("turn/start");
