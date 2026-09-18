@@ -1584,7 +1584,7 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
             shard.groups.find((group) => group.shard_name === original.shard_name),
             "retained ordinary group",
           );
-          if (originalHybridJob.planConcurrency === 2) {
+          if (usesTwoWorkerPacking(originalHybridJob)) {
             expect(retained).toEqual({
               ...original,
               env: { OPENCLAW_VITEST_MAX_WORKERS: "2", ...original.env },
@@ -3910,7 +3910,7 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
       const inheritedGroupsFor = (admission: typeof before) =>
         new Map(
           admission.flatMap((job) =>
-            job.planConcurrency === 2
+            usesTwoWorkerPacking(job)
               ? job.groups
                   .filter((group) => group.env?.OPENCLAW_VITEST_MAX_WORKERS === undefined)
                   .map((group): [string, Group] => [group.shard_name, group])
@@ -3929,9 +3929,11 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
           entry.groups.some((candidate) => candidate.shard_name === group.shard_name),
         );
         if (original && job?.planConcurrency === 1) {
-          const env = expectDefined(group.env, "materialized serial worker cap");
-          expect(env.OPENCLAW_VITEST_MAX_WORKERS).toBe("2");
-          const { OPENCLAW_VITEST_MAX_WORKERS: _workers, ...otherEnv } = env;
+          // Gateway serialization retains the cap on the job; runtime promotion materializes it.
+          expect(
+            group.env?.OPENCLAW_VITEST_MAX_WORKERS ?? job.env?.OPENCLAW_VITEST_MAX_WORKERS,
+          ).toBe("2");
+          const { OPENCLAW_VITEST_MAX_WORKERS: _workers, ...otherEnv } = group.env ?? {};
           expect(otherEnv).toEqual(original.env ?? {});
           return original.env;
         }
@@ -4032,7 +4034,21 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
           ),
           "existing parallel recipient with hosted timing parts",
         );
+        const serializedAdmission = structuredClone(beforeAdmission);
+        const serializedRecipient = expectDefined(
+          serializedAdmission.find((job) => job.checkName === recipient.checkName),
+          "recipient before Gateway serialization",
+        );
+        serializedRecipient.planConcurrency = 1;
+        serializedRecipient.env = { ...serializedRecipient.env, OPENCLAW_VITEST_MAX_WORKERS: "2" };
+        const serializedInherited = inheritedGroupsFor(serializedAdmission);
+        expect(serializedInherited).toEqual(beforeInherited);
         recipient.planConcurrency = 1;
+        recipient.env = { ...recipient.env, OPENCLAW_VITEST_MAX_WORKERS: "2" };
+        expectTimingFamilies(promoted, serializedInherited);
+        expect(policies(promoted, serializedInherited)).toEqual(policies(before, beforeInherited));
+        delete recipient.env.OPENCLAW_VITEST_MAX_WORKERS;
+        expect(() => expectTimingFamilies(promoted, serializedInherited)).toThrow();
         recipient.pretestBuildMode = "runtime";
         const keys = recipient.groups.map((group) => group.timing_key);
         for (const group of recipient.groups) {
