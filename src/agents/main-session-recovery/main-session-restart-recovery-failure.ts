@@ -1,21 +1,22 @@
+import { isDeepStrictEqual } from "node:util";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { stripInternalMetadataForDisplay } from "../../auto-reply/reply/display-text-sanitize.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import { hasRestartRecoveryTerminalRun } from "../../config/sessions/restart-recovery-state.js";
-import type {
-  SessionTranscriptTurnExpectedState,
-  SessionTranscriptTurnLifecyclePatch,
-} from "../../config/sessions/session-accessor.js";
+import type { RestartRecoveryTerminalDeliveryEvidenceResult } from "../../config/sessions/restart-recovery-types.js";
+import { readSessionEntryReadOnlyInWorker } from "../../config/sessions/session-entry-read-runtime.js";
 import type { SessionSourceAssertion } from "../../config/sessions/session-source-authority.js";
 import { buildRestartRecoveryExpectedState } from "../../config/sessions/session-transcript-turn-state.js";
 import { appendAssistantMessageToSessionTranscript } from "../../config/sessions/transcript.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
-import type { DeliveryContext } from "../../utils/delivery-context.shared.js";
 import { readRestartRecoveryRequesterSource } from "../requester-run-recovery-source.js";
 import { buildMainSessionRecoverySettlementPatch } from "./main-session-recovery-clear.js";
 import type { MainSessionRecoveryObservation } from "./main-session-recovery-state.js";
-import { commitMainSessionRecovery } from "./main-session-recovery-store.js";
+import {
+  commitMainSessionRecovery,
+  type MainSessionRecoveryStoreTarget,
+} from "./main-session-recovery-store.js";
 import { resolveRestartRecoveryDeliveryContext } from "./main-session-restart-recovery-delivery.js";
 import {
   mainSessionRecoveryLog,
@@ -64,22 +65,28 @@ export async function prepareRequesterRestartRecovery(params: {
 }
 
 /** Publish one local interruption notice and retire the exact input without replay or delivery. */
-export async function settleInterruptedRestartRecovery(params: {
-  agentId: string;
+async function settleInterruptedRestartRecovery(params: {
+  agentId?: string;
   entry: SessionEntry;
-  observation: MainSessionRecoveryObservation;
+  observation?: MainSessionRecoveryObservation;
   sessionKey: string;
   storePath: string;
   assertCurrent: () => void;
   reason: string;
+  cronOwned?: boolean;
+  terminalRunId?: string;
+  terminalStatus?: "failed" | "timeout" | "killed";
+  terminalDeliveryEvidence?: RestartRecoveryTerminalDeliveryEvidenceResult;
+  clearRecoveryState?: boolean;
 }): Promise<{ outcome: "settled" | "changed" | "failed" }> {
   const { entry, reason } = params;
   // Legacy interrupted inputs can lack both run IDs. The recovery cycle still
   // identifies their settlement; this receipt never authorizes execution.
   const terminalRunId =
+    params.terminalRunId ??
     entry.restartRecoveryDeliveryRunId ??
     entry.restartRecoveryDeliverySourceRunId ??
-    `main-session-restart-recovery:${params.observation.cycleId}:interrupted`;
+    `main-session-restart-recovery:${params.observation?.cycleId}:interrupted`;
   const endedAt = Date.now();
   const capturedReply =
     entry.pendingFinalDelivery?.kind === "replayable"
@@ -98,16 +105,20 @@ export async function settleInterruptedRestartRecovery(params: {
     assertCurrent: params.assertCurrent,
     idempotencyKey: `main-session-restart-recovery:${entry.restartRecoveryDeliverySourceRunId ?? terminalRunId}:interrupted`,
     text:
-      `This interrupted turn could not resume after the Gateway restarted: ${reason}. ` +
-      "Your session and transcript are preserved. Send a new authenticated message to continue." +
+      (params.cronOwned
+        ? "The scheduled turn was interrupted by a Gateway restart. Cron owns its continuation; check the job history for its retry or interruption outcome. Your session and transcript are preserved."
+        : `This interrupted turn could not resume after the Gateway restarted: ${reason}. ` +
+          "Your session and transcript are preserved. Send a new authenticated message to continue.") +
       (capturedReply ? `\n\nSaved reply (delivery unconfirmed):\n${capturedReply}` : ""),
     sessionLifecyclePatch: {
       ...buildMainSessionRecoverySettlementPatch({
         entry,
         recordTerminalSource: true,
         terminalRunId,
+        terminalDeliveryEvidence: params.terminalDeliveryEvidence,
+        clearRecoveryState: params.clearRecoveryState,
       }),
-      status: "interrupted",
+      status: params.terminalStatus ?? "interrupted",
       pendingFinalDelivery: undefined,
       lifecycleRunId: undefined,
       lastRunId: resolveRestartRecoveryTerminalClientRunId(entry) ?? terminalRunId,
@@ -129,22 +140,80 @@ export async function settleInterruptedRestartRecovery(params: {
   return { outcome: "failed" };
 }
 
+/** A failed legacy continuation consumes its saved final, not another delivery owner's intent. */
+export async function settleTerminalPendingFinalRecovery(
+  params: MainSessionRecoveryStoreTarget & {
+    expectedSessionId: string;
+    pendingFinalDelivery: SessionEntry["pendingFinalDelivery"];
+    runId: string;
+    status: "failed" | "timeout" | "killed";
+    terminalDeliveryEvidence?: RestartRecoveryTerminalDeliveryEvidenceResult;
+    assertCurrent: () => void;
+  },
+): Promise<boolean> {
+  const pending = params.pendingFinalDelivery;
+  if (pending?.kind !== "replayable" || pending.intentId || pending.deliveries?.length) {
+    return false;
+  }
+  const entry = await readSessionEntryReadOnlyInWorker(params, params.assertCurrent);
+  if (
+    !entry ||
+    entry.sessionId !== params.expectedSessionId ||
+    entry.abortedLastRun === true ||
+    entry.restartRecoveryHarnessCompletion ||
+    (entry.restartRecoveryDeliveryRunId !== params.runId &&
+      !(
+        entry.lifecycleRunId === params.runId && hasRestartRecoveryTerminalRun(entry, params.runId)
+      )) ||
+    !isDeepStrictEqual(entry.pendingFinalDelivery, {
+      ...pending,
+      text: stripInternalMetadataForDisplay(pending.text),
+    }) ||
+    entry.restartRecoveryRuns?.some(
+      (run) =>
+        run.runId !== params.runId &&
+        run.runId !== entry.restartRecoveryDeliverySourceRunId &&
+        !hasRestartRecoveryTerminalRun(entry, run.runId),
+    )
+  ) {
+    return false;
+  }
+  const result = await settleInterruptedRestartRecovery({
+    ...params,
+    entry,
+    terminalRunId: params.runId,
+    terminalStatus: params.status,
+    // Queued foreground inputs can own the cycle before registering a run fence.
+    clearRecoveryState:
+      !entry.mainRestartRecovery?.foregroundClaims && !entry.mainRestartRecovery?.reservation,
+    reason: "the recovery turn ended without completing the saved final reply",
+  });
+  return result.outcome === "settled";
+}
+
 /** Sender loss retires one input only when no other execution or delivery custody remains. */
 export async function finishDelegatedRestartRecovery(
   params: Parameters<typeof tombstoneMainRestartRecoveryWithNotice>[0] & {
     assertCurrent: () => void;
+    cronOwned?: boolean;
   },
 ): Promise<"notice_failed" | "skipped" | "tombstoned" | "settled"> {
   const { entry } = params;
+  const unfinishedRuns = (entry.restartRecoveryRuns ?? []).filter(
+    (run) => !hasRestartRecoveryTerminalRun(entry, run.runId),
+  );
+  // Cron can leave an older delivery-source claim beside its single interrupted
+  // turn. Retire that residue so the scheduler can re-admit the conversation.
+  // Multiple unfinished turns or pending delivery still retain their custody.
   if (
     entry.pendingFinalDelivery ||
     entry.restartRecoveryHarnessCompletion ||
-    (entry.restartRecoveryRuns ?? []).some(
-      (run) =>
-        run.runId !== entry.restartRecoveryDeliveryRunId &&
-        run.runId !== entry.restartRecoveryDeliverySourceRunId &&
-        !hasRestartRecoveryTerminalRun(entry, run.runId),
-    )
+    (!(params.cronOwned && unfinishedRuns.length <= 1) &&
+      unfinishedRuns.some(
+        (run) =>
+          run.runId !== entry.restartRecoveryDeliveryRunId &&
+          run.runId !== entry.restartRecoveryDeliverySourceRunId,
+      ))
   ) {
     return await tombstoneMainRestartRecoveryWithNotice(params);
   }
@@ -170,55 +239,6 @@ function buildRestartRecoveryTombstoneNoticeKey(entry: SessionEntry): string {
     normalizeOptionalString(entry.restartRecoveryDeliveryRunId) ??
     entry.sessionId;
   return `main-session-restart-recovery:${interruptedRunId}:failed-notice`;
-}
-
-async function sendRestartRecoveryTombstoneNotice(params: {
-  deliveryContext: DeliveryContext & { channel: string; to: string };
-  entry: SessionEntry;
-  gatewayRuntime: GatewayRecoveryRuntime;
-  reason: string;
-  sessionKey: string;
-}): Promise<void> {
-  try {
-    await params.gatewayRuntime.sendRecoveryNotice({
-      channel: params.deliveryContext.channel,
-      to: params.deliveryContext.to,
-      accountId: params.deliveryContext.accountId,
-      threadId: params.deliveryContext.threadId,
-      text: buildTombstonedSessionNotice(params.reason),
-      idempotencyKey: buildRestartRecoveryTombstoneNoticeKey(params.entry),
-    });
-    mainSessionRecoveryLog.info(
-      `sent restart recovery tombstone notice: ${params.sessionKey} (${params.reason})`,
-    );
-  } catch (error) {
-    mainSessionRecoveryLog.warn(
-      `failed to send restart recovery tombstone notice ${params.sessionKey}: ${String(error)}`,
-    );
-  }
-}
-
-async function writeRestartRecoveryTombstoneNotice(params: {
-  agentId: string;
-  entry: SessionEntry;
-  sessionKey: string;
-  storePath: string;
-  expectedSessionState: SessionTranscriptTurnExpectedState;
-  sessionLifecyclePatch: SessionTranscriptTurnLifecyclePatch;
-  reason: string;
-}): Promise<boolean> {
-  const result = await appendAssistantMessageToSessionTranscript({
-    ...params,
-    expectedSessionId: params.entry.sessionId,
-    text: buildTombstonedSessionNotice(params.reason),
-    idempotencyKey: buildRestartRecoveryTombstoneNoticeKey(params.entry),
-  }).catch((error: unknown) => ({ ok: false as const, reason: String(error) }));
-  if (!result.ok) {
-    mainSessionRecoveryLog.warn(
-      `failed to write restart recovery tombstone notice ${params.sessionKey}: ${result.reason}`,
-    );
-  }
-  return result.ok;
 }
 
 export async function tombstoneMainRestartRecoveryWithNotice(params: {
@@ -250,7 +270,7 @@ export async function tombstoneMainRestartRecoveryWithNotice(params: {
       return "skipped";
     }
     const now = Date.now();
-    const written = await writeRestartRecoveryTombstoneNotice({
+    const result = await appendAssistantMessageToSessionTranscript({
       ...params,
       expectedSessionState: buildRestartRecoveryExpectedState(entry, observation),
       sessionLifecyclePatch: {
@@ -267,8 +287,16 @@ export async function tombstoneMainRestartRecoveryWithNotice(params: {
         status: "failed",
         updatedAt: now,
       },
-    });
-    return written ? "tombstoned" : "notice_failed";
+      expectedSessionId: entry.sessionId,
+      text: buildTombstonedSessionNotice(params.reason),
+      idempotencyKey: buildRestartRecoveryTombstoneNoticeKey(entry),
+    }).catch((error: unknown) => ({ ok: false as const, reason: String(error) }));
+    if (!result.ok) {
+      mainSessionRecoveryLog.warn(
+        `failed to write restart recovery tombstone notice ${params.sessionKey}: ${result.reason}`,
+      );
+    }
+    return result.ok ? "tombstoned" : "notice_failed";
   }
   const claim = await commitMainSessionRecovery({
     command: {
@@ -286,10 +314,23 @@ export async function tombstoneMainRestartRecoveryWithNotice(params: {
   mainSessionRecoveryLog.warn(
     `tombstoned main-session restart recovery: ${params.sessionKey} (${params.reason})`,
   );
-  await sendRestartRecoveryTombstoneNotice({
-    ...params,
-    deliveryContext,
-    entry: claim.entry,
-  });
+  const { gatewayRuntime, reason, sessionKey } = params;
+  try {
+    await gatewayRuntime.sendRecoveryNotice({
+      channel: deliveryContext.channel,
+      to: deliveryContext.to,
+      accountId: deliveryContext.accountId,
+      threadId: deliveryContext.threadId,
+      text: buildTombstonedSessionNotice(reason),
+      idempotencyKey: buildRestartRecoveryTombstoneNoticeKey(claim.entry),
+    });
+    mainSessionRecoveryLog.info(
+      `sent restart recovery tombstone notice: ${sessionKey} (${reason})`,
+    );
+  } catch (error) {
+    mainSessionRecoveryLog.warn(
+      `failed to send restart recovery tombstone notice ${sessionKey}: ${String(error)}`,
+    );
+  }
   return "tombstoned";
 }

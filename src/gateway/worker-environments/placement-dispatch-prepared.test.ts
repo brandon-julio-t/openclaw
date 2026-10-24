@@ -8,10 +8,7 @@ import {
   GATEWAY_CLIENT_IDS,
   GATEWAY_CLIENT_MODES,
 } from "../../../packages/gateway-protocol/src/client-info.js";
-import {
-  WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
-  WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
-} from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
+import { WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { createGitHubReadIdentity } from "../../agents/github-read-identity.js";
 import { getRuntimeConfig } from "../../config/config.js";
@@ -39,15 +36,18 @@ import { bindDeviceWorkerAvailability } from "./device-provider.js";
 import type { EnvironmentRecipe } from "./environment-recipe.js";
 import { REQUEST } from "./placement-dispatch-test-fixtures.js";
 import { createHarness } from "./placement-dispatch-test-harness.js";
+import { WORKER_PROTOCOL_FEATURES } from "./placement-lifecycle.test-support.js";
 import type { WorkerPlacementExecutionMode } from "./placement-record.js";
 import { createWorkerSessionPlacementStore } from "./placement-store.js";
 import type { WorkerProviderPreparedIntent } from "./preparation-identity.js";
+import type { WorkerProjectPreparationIdentity } from "./preparation-identity.schema.js";
 import { prepareRepositoryGitHubIdentity } from "./repository-github-identity.js";
 import * as support from "./service.test-support.js";
 import {
   readSessionRepositoryArtifacts,
   stageSessionRepositoryCheckpoint,
 } from "./session-repository-checkpoints.js";
+import type { WorkerProjectSnapshot } from "./workspace-git-base.js";
 import { captureWorkspaceManifest } from "./workspace-manifest-worker.js";
 import { serializeWorkerWorkspaceManifest } from "./workspace-manifest.js";
 import { requireWorkspaceResultGit } from "./workspace-result-git.js";
@@ -63,10 +63,7 @@ vi.mock("../../config/config.js", async (importOriginal) => ({
 }));
 
 const PREPARATION_KEY = "c".repeat(64);
-const FEATURES = [
-  WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
-  WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
-];
+const FEATURES = [...WORKER_PROTOCOL_FEATURES];
 
 async function preparedHarness(
   options: {
@@ -74,7 +71,7 @@ async function preparedHarness(
     protocolFeatures?: string[];
     executionMode?: WorkerPlacementExecutionMode;
     emptyWorkspace?: boolean;
-    repository?: SessionRepositoryWorkspaceRecord;
+    repository?: SessionRepositoryWorkspaceRecord & { baseCommit: string };
     recipe?: EnvironmentRecipe;
     lifecycleFailure?: boolean;
     boundWorkspace?: Pick<
@@ -108,7 +105,7 @@ async function preparedHarness(
       ),
   });
   const environmentId = reserve ? "prepared-spare" : harness.ready.environmentId;
-  const preparation = {
+  const preparation: WorkerProjectPreparationIdentity = {
     key: PREPARATION_KEY,
     cacheKey: "a".repeat(64),
     contractVersion: 1,
@@ -122,40 +119,38 @@ async function preparedHarness(
       protocolFeatures,
     },
   };
+  const project: WorkerProjectSnapshot = options.repository
+    ? {
+        key: "d".repeat(64),
+        baseCommit: options.repository.baseCommit,
+        source: {
+          kind: "repository",
+          url: options.repository.url,
+          repositoryId: "R_dispatch_fixture",
+          owner: {
+            agent: { agentId: REQUEST.agentId, provenance: null },
+            identity: { source: "anonymous" },
+          },
+        },
+      }
+    : { key: "d".repeat(64), baseCommit: "e".repeat(40), root: "/gateway/workspace" };
+  const profile = { settings: { region: "test" }, executionMode };
   const intent: WorkerProviderPreparedIntent = {
     providerId: "fake",
-    preparationKey: PREPARATION_KEY,
-    profileSnapshot: {
-      settings: { region: "test" },
-      executionMode,
-      ...(options.emptyWorkspace
-        ? { runtimePreparation: { ...preparation, source: "empty" } }
-        : {
-            project: {
-              key: "d".repeat(64),
-              baseCommit: options.repository?.baseCommit ?? "e".repeat(40),
-              ...(options.repository
-                ? {
-                    source: {
-                      kind: "repository",
-                      url: options.repository.url,
-                      repositoryId: "R_dispatch_fixture",
-                      owner: {
-                        agent: { agentId: REQUEST.agentId, provenance: null },
-                        identity: { source: "anonymous" },
-                      },
-                    },
-                  }
-                : { root: "/gateway/workspace" }),
-              preparation: {
-                ...preparation,
-                ...(options.recipe
-                  ? { recipe: options.recipe, setupRecipe: options.recipe.identity }
-                  : {}),
-              },
+    profileSnapshot: options.emptyWorkspace
+      ? { ...profile, runtimePreparation: { ...preparation, source: "empty" } }
+      : {
+          ...profile,
+          project: {
+            ...project,
+            preparation: {
+              ...preparation,
+              ...(options.recipe
+                ? { recipe: options.recipe, setupRecipe: options.recipe.identity }
+                : {}),
             },
-          }),
-    },
+          },
+        },
   };
   const store = support.testState.store;
   await store.createIntent({
@@ -824,7 +819,7 @@ describe("prepared worker dispatch", () => {
         preparedManifestRef: base.manifestRef,
       };
       const { harness, store, ready, request } = await preparedHarness({
-        repository: accepted,
+        repository: { ...accepted, baseCommit },
         boundWorkspace,
         ...(runSetupScript ? { recipe: lifecycleRecipe } : {}),
       });

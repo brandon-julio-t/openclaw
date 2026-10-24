@@ -232,7 +232,7 @@ function makeInput(overrides: RecoveryInputOverrides = {}): RecoveryInput {
         promptTokenBudget: tokenBudget,
         degradedReason,
       }),
-    onCompactionHookMessages: vi.fn(async () => {}),
+    onCompactionHookMessages: vi.fn(),
     runOwnsCompactionBeforeHook: vi.fn(async () => {}),
     runOwnsCompactionAfterHook: vi.fn(async () => {}),
     adoptCompactionTranscript: vi.fn(async () => undefined),
@@ -312,6 +312,36 @@ describe("recoverEmbeddedRunOverflow", () => {
     // must outrank them so validation-shaped wrappers still recover.
     assistantOverflowCandidate.errorType = "invalid_request_error";
     assistantOverflowCandidate.errorCode = "invalid_parameter_error";
+    const result = await recoverEmbeddedRunOverflow(
+      makeInput({ promptError: null, assistantOverflowCandidate }),
+    );
+
+    expect(result).toEqual({ action: "retry" });
+    expect(mocks.compact).toHaveBeenCalledOnce();
+    expect(mocks.warn).toHaveBeenCalledWith(expect.stringContaining("source=assistantError"));
+  });
+
+  it("recovers a SiliconFlow max_seq_len overflow as context overflow", async () => {
+    const assistantOverflowCandidate = makeAssistantMessage({
+      stopReason: "error",
+      errorMessage:
+        '400 {"code":20015,"message":"length of prompt_tokens (51353) must be less than max_seq_len (32768).","data":null}',
+    });
+    const result = await recoverEmbeddedRunOverflow(
+      makeInput({ promptError: null, assistantOverflowCandidate }),
+    );
+
+    expect(result).toEqual({ action: "retry" });
+    expect(mocks.compact).toHaveBeenCalledOnce();
+    expect(mocks.warn).toHaveBeenCalledWith(expect.stringContaining("source=assistantError"));
+  });
+
+  it("recovers a vLLM max_model_len overflow as context overflow", async () => {
+    const assistantOverflowCandidate = makeAssistantMessage({
+      stopReason: "error",
+      errorMessage:
+        "400 The decoder prompt (length 40000) is longer than the maximum model length of 32768. Make sure that `max_model_len` is no smaller than the number of text tokens.",
+    });
     const result = await recoverEmbeddedRunOverflow(
       makeInput({ promptError: null, assistantOverflowCandidate }),
     );
@@ -551,6 +581,27 @@ describe("recoverEmbeddedRunOverflow", () => {
     // gets its full compaction attempts and its one tool-result truncation.
     expect(input.state.overflowCompactionAttempts).toBe(0);
     expect(input.state.toolResultTruncationAttempted).toBe(false);
+  });
+
+  it("attributes oversized fixed context without retrying compaction or suggesting reset", async () => {
+    const input = makeInput({ contextTokenBudget: 32_000 });
+    input.state.compactionRequestBudget = createCompactionRequestBudget({
+      contextWindow: 32_000,
+      reserveTokens: 4_000,
+      systemPrompt: "Plugin instructions. ".repeat(10_000),
+      pendingPrompt: "hello",
+    });
+    const result = await recoverEmbeddedRunOverflow(input);
+    expect(result).toMatchObject({
+      action: "surface",
+      kind: "context_overflow",
+      userText: expect.stringContaining("system prompt, injected context, or tool definitions"),
+    });
+    expect(result).toMatchObject({
+      userText: expect.stringContaining("Reduce plugin-provided system context"),
+    });
+    expect(mocks.compact).not.toHaveBeenCalled();
+    expect(mocks.truncateOversizedToolResults).not.toHaveBeenCalled();
   });
 
   it("rejects oversized pending input once and answers after its persisted history is compacted", async () => {

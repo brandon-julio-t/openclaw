@@ -30,12 +30,14 @@ import {
 import { hasLiveAgentRunContext, listAgentRunsForSession } from "../../infra/agent-run-registry.js";
 import {
   captureGatewaySessionControllerWork,
+  captureSessionControllerSettlement,
   isSessionControllerWorkActive,
 } from "../../sessions/session-controller.lifecycle.js";
 import { resolveExplicitIncognitoAgentSqliteTarget } from "../../state/openclaw-agent-db.paths.js";
 import {
   hasCompletedMainSessionRecoveryOutcome,
   isMainRestartRecoveryTerminalOnly,
+  isKilledMainSessionRecoveryFenceOnly,
   transitionMainSessionRecovery,
 } from "./main-session-recovery-state.js";
 import type { MainSessionRecoveryStoreTarget } from "./main-session-recovery-store.js";
@@ -69,7 +71,7 @@ async function markRecoveryStore(params: {
         replaceRuns?: boolean;
         runs?: RestartRecoveryRun[];
       }
-    | { action: "retire_terminal" }
+    | { action: "retire_terminal" | "release_killed" }
     | { action: "restore_yielded"; isCurrent: () => boolean }
     | undefined;
 }) {
@@ -103,7 +105,7 @@ async function markRecoveryStore(params: {
           }
           transitionMainSessionRecovery(
             entry,
-            plan.action === "restore_yielded"
+            plan.action === "restore_yielded" || plan.action === "release_killed"
               ? { kind: "clear" }
               : {
                   kind: "observe",
@@ -287,6 +289,7 @@ export async function markRestartAbortedMainSessions(params: {
               captureYieldedMainSessionContinuation({
                 entry,
                 requester,
+                purpose: "recovery",
               })
             ) {
               recordSkip("yielded_continuation", sessionKey);
@@ -372,6 +375,10 @@ type OrphanMarkParams = {
   cfg?: OpenClawConfig;
   updatedBeforeMs?: number;
   lifecycleGeneration: string;
+  onOwnerPending?: (
+    target: RestartRecoveryStoreTarget & { sessionKey: string; sessionId: string },
+    settled: Promise<void>,
+  ) => void;
 };
 
 async function markOrphanedMainSessionStore(
@@ -451,11 +458,22 @@ async function markOrphanedMainSessionStore(
         ) ||
         isSessionControllerWorkActive(params.target.storePath, [sessionKey, entry.sessionId]);
       if (hasLiveOwner()) {
+        const settled = captureSessionControllerSettlement({
+          scope: params.target.storePath,
+          identities: [sessionKey, entry.sessionId],
+        });
+        if (settled) {
+          params.onOwnerPending?.(
+            { ...params.target, sessionKey, sessionId: entry.sessionId },
+            settled,
+          );
+        }
         return undefined;
       }
       const continuation = captureYieldedMainSessionContinuation({
         entry,
         requester: requesters.get(sessionKey),
+        purpose: "recovery",
       });
       if (continuation) {
         // A newer foreground start clears endedAt. Only an unclaimed waiting cycle
@@ -474,6 +492,12 @@ async function markOrphanedMainSessionStore(
           };
         }
         return undefined;
+      }
+      if (isKilledMainSessionRecoveryFenceOnly(entry)) {
+        // Stop is terminal. An ownerless fence must not resurrect the run or
+        // hold the conversation forever; pending delivery remains with recovery.
+        orphanChecks.push(hasLiveOwner);
+        return { action: "release_killed" };
       }
       // A crash or early restart abort can persist the interruption without a claim.
       // Reuse the normal mark transition, preserving budgets on existing cycles.
@@ -530,12 +554,15 @@ export async function markStartupOrphanedMainSessionsForRecovery(params: {
   stateDir?: string;
   startupCheckedStorePaths?: Set<string>;
   updatedBeforeMs?: number;
+  onOwnerPending?: OrphanMarkParams["onOwnerPending"];
+  assertCommitAllowed?: () => void;
 }): Promise<{ marked: number; skipped: number; failedTargets?: RestartRecoveryStoreTarget[] }> {
   const result = { marked: 0, skipped: 0 };
   const failedTargets: RestartRecoveryStoreTarget[] = [];
   const lifecycleGeneration = getAgentEventLifecycleGeneration();
   const storeTargets = await discoverRestartRecoveryStoreTargets(params);
   for (const target of storeTargets) {
+    params.assertCommitAllowed?.();
     const key = restartRecoveryStoreTargetKey(target);
     if (params.startupCheckedStorePaths?.has(key)) {
       continue;

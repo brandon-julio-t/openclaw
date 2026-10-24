@@ -5,6 +5,7 @@ import {
   type OverlayPlacement,
 } from "../../components/overlay-anchor.ts";
 import { findOverlayParent, type Overlay } from "../../components/overlay-lifecycle.ts";
+import { listen } from "./listener.ts";
 
 type Placement = OverlayPlacement | (() => OverlayPlacement);
 type AnchorTarget = { anchor?: HTMLElement; placement?: Placement };
@@ -14,12 +15,18 @@ export function createAnchoredOverlay(
   overlay: Overlay,
   trigger: () => HTMLElement,
   target: () => AnchorTarget,
-  options: { sameRoot?: boolean; anchored?: boolean; paused?: () => boolean } = {},
+  options: {
+    sameRoot?: boolean;
+    anchored?: boolean;
+    lazy?: boolean;
+    paused?: () => boolean;
+    parent?: Overlay;
+  } = {},
 ) {
   let binding: OverlayAnchorBinding | undefined;
   const bindTrigger = (anchor: HTMLElement) => {
     overlay.bindTrigger(anchor);
-    overlay.setParent(findOverlayParent(anchor));
+    overlay.setParent(options.parent ?? findOverlayParent(anchor));
   };
   // Direction-dependent placement reads committed DOM, never the effect's compute phase.
   const update = (anchor: HTMLElement, placement?: Placement) =>
@@ -36,16 +43,31 @@ export function createAnchoredOverlay(
     update,
     // The caller binds its surface first and preserves its control teardown order.
     connect() {
-      const { anchor, placement } = target();
-      const current = anchor ?? trigger();
+      const { anchor: initialAnchor, placement: initialPlacement } = target();
+      const current = initialAnchor ?? trigger();
       bindTrigger(current);
+      let stopShow: (() => void) | undefined;
       if (options.anchored !== false) {
-        binding = createOverlayAnchor(overlay.surface, options);
-        if (!options.paused?.()) {
-          update(current, placement);
+        const bind = (anchor: HTMLElement, placement?: Placement) => {
+          binding ??= createOverlayAnchor(overlay.surface, options);
+          if (!options.paused?.()) {
+            update(anchor, placement);
+          }
+        };
+        if (options.lazy) {
+          stopShow = listen(overlay.surface, "overlay-show", (event) => {
+            if (event.target === overlay.surface && !event.defaultPrevented && !binding) {
+              // A later veto may retain this binding; untouched menus never register one.
+              const { anchor, placement } = target();
+              bind(anchor ?? trigger(), placement);
+            }
+          });
+        } else {
+          bind(current, initialPlacement);
         }
       }
       return () => {
+        stopShow?.();
         binding?.dispose();
         binding = undefined;
       };

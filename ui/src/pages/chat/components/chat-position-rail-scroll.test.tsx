@@ -41,10 +41,20 @@ it("updates rail and end position without pane renders until the virtual range c
   let renderedAt: number;
   const recordViewport = vi.spyOn(TranscriptEndAnchor.prototype, "recordViewport");
   const transcript = host.transcript;
+  const messageElements = transcript.renderSession(
+    "agent:main:rail-notification",
+    (session) => session.messageElements,
+  );
   const rows: TestContentRow[] = Array.from({ length: 40 }, (_, index) => ({
     kind: "content",
     key: `row-${index}`,
-    content: <div class="chat-bubble" data-entry-id={`row-${index}`} />,
+    content: (
+      <div
+        ref={messageElements.forKey(`row-${index}`)}
+        class="chat-bubble"
+        data-entry-id={`row-${index}`}
+      />
+    ),
   }));
   const ids = rows.map((row) => row.key);
   const identityMap = () => new Map(ids.map((id) => [id, id]));
@@ -112,6 +122,11 @@ it("updates rail and end position without pane renders until the virtual range c
     document.body.append(host);
     await settleUpdates();
     const marks = container.querySelector<HTMLElement>(".chat-position-rail__marks")!;
+    const measureRail = () => {
+      for (const observer of resizeObservers) {
+        observer.emitTarget(marks, 44, 240);
+      }
+    };
     const readRailHeight = vi.fn(() => 240);
     Object.defineProperty(marks, "clientHeight", { configurable: true, get: readRailHeight });
     const readRailOffset = vi.spyOn(marks, "scrollTop", "get");
@@ -121,6 +136,7 @@ it("updates rail and end position without pane renders until the virtual range c
       observer.emitTarget(marks, 44, 240);
     }
     scrollTo(50);
+    measureRail();
     await settleUpdates();
     await settleUpdates(true);
     await settleUpdates(true);
@@ -146,7 +162,7 @@ it("updates rail and end position without pane renders until the virtual range c
     };
     // A stream commit can dirty the transcript without changing any markers.
     rows[0]!.content = (
-      <div class="chat-bubble" data-entry-id="row-0">
+      <div ref={messageElements.forKey("row-0")} class="chat-bubble" data-entry-id="row-0">
         Updated content
       </div>
     );
@@ -175,6 +191,8 @@ it("updates rail and end position without pane renders until the virtual range c
     offsets.length = 0;
     scrollTo(55);
     expect(offsets).toEqual([5]);
+    expectNoRailFrameReads();
+    measureRail();
     clearRailReads();
     await settleUpdates(true);
     expectNoRailFrameReads();
@@ -185,9 +203,19 @@ it("updates rail and end position without pane renders until the virtual range c
     // the rail must still publish its midpoint crossing and keyboard entry.
     scrollTo(70);
     expect(offsets).toEqual([5, 15]);
+    measureRail();
     await settleUpdates(true);
     expect(host.committedRenders).toBe(renderedAt);
     expectCurrent("row-3");
+    await settleUpdates(true);
+    const railStyles = vi.spyOn(marks.style, "setProperty");
+    readContentHeight.mockReturnValue(4812);
+    measureRail();
+    await settleUpdates(true);
+    expect(railStyles).not.toHaveBeenCalled();
+    expectCurrent("row-3");
+    railStyles.mockRestore();
+    readContentHeight.mockReturnValue(4800);
     container.dispatchEvent(new WheelEvent("wheel", { deltaY: 600 }));
     await settleUpdates();
     renderedAt = host.committedRenders;
@@ -197,12 +225,14 @@ it("updates rail and end position without pane renders until the virtual range c
 
     // The precise end edge is recorded without committing the unchanged virtual range.
     scrollTo(4198.5);
+    measureRail();
     await settleUpdates();
     await settleUpdates(true);
     await settleUpdates(true);
     expect(recordViewport.mock.results.at(-1)?.value).toBe(false);
     renderedAt = host.committedRenders;
     scrollTo(4199.5);
+    measureRail();
     await settleUpdates();
     expect(recordViewport.mock.results.at(-1)?.value).toBe(true);
     expect(host.committedRenders).toBe(renderedAt);
@@ -211,6 +241,7 @@ it("updates rail and end position without pane renders until the virtual range c
     await settleUpdates(true);
     renderedAt = host.committedRenders;
     scrollTo(4199.75);
+    measureRail();
     await settleUpdates(true);
     expect(host.committedRenders).toBe(renderedAt);
 
@@ -219,6 +250,7 @@ it("updates rail and end position without pane renders until the virtual range c
     const firstRowBefore =
       container.querySelector<HTMLElement>(".chat-virtual-row")?.dataset.virtualRowKey;
     scrollTo(4200);
+    measureRail();
     await settleUpdates();
     await settleUpdates(true);
     expect(host.committedRenders).toBe(renderedAt + 1);
