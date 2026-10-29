@@ -47,8 +47,8 @@ An agent-turn automation bound to a persistent session and carrying a server-aut
 
 A verified subagent-completion turn can finish pinned updates on its requester’s
 browser-capable conversation dashboard when the replayed requester policy allows
-`show_widget`. It must use `pin: true`; the completion does not inherit inline
-rendering rights. Unverified inter-session input cannot enable this surface.
+`show_widget`. It must use `pin: true` without `presentation.target`; the
+completion does not inherit inline or device presentation rights. Unverified inter-session input cannot enable this surface.
 
 A post-restart input uses the session's current authority and tool policy. It does
 not inherit an old browser connection or device presentation rights. Inline
