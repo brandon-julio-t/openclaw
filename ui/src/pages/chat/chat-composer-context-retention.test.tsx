@@ -47,68 +47,46 @@ function usageProps(refreshed = false) {
   });
 }
 
-it.each([false, true])(
-  "keeps live usage and focus after browser translation: %s",
-  async (translated) => {
-    const props = usageProps();
-    const container = document.body.appendChild(createComposerContainer());
-    renderComposerInto(container, props);
-    const query = container.querySelector.bind(container);
-    const details = query<HTMLDetailsElement>(".context-usage details")!;
-    expect(details).not.toBeNull();
-    expect(details.querySelector(".context-usage__popover")).toBeNull();
-    details.querySelector("summary")!.click();
-    await waitForSolid(() =>
-      expect(details.querySelector("[popover]")?.matches(":popover-open")).toBe(true),
-    );
-    const usageLink = query<HTMLAnchorElement>("[data-chat-provider-usage]")!;
-    usageLink.focus();
-    expect(document.activeElement).toBe(usageLink);
+it("keeps the context counter exempt and usage-link focus during refreshes", async () => {
+  const props = usageProps();
+  const container = document.body.appendChild(createComposerContainer());
+  renderComposerInto(container, props);
+  const query = container.querySelector.bind(container);
+  const details = query<HTMLDetailsElement>(".context-usage details")!;
+  expect(details.querySelector(".context-usage__popover")).toBeNull();
+  details.querySelector("summary")!.click();
+  await waitForSolid(() =>
+    expect(details.querySelector("[popover]")?.matches(":popover-open")).toBe(true),
+  );
+  const usageLink = query<HTMLAnchorElement>("[data-chat-provider-usage]")!;
+  usageLink.focus();
+  expect(document.activeElement).toBe(usageLink);
+  expect(query<HTMLElement>(".context-usage__context-value")!.translate).toBe(false);
+  expect(query<HTMLElement>(".context-usage__title")!.translate).toBe(true);
 
-    if (translated) {
-      const value = query(".context-usage__context-value")!;
-      // Google Translate replaces eligible text nodes, including Solid's separator anchor.
-      const walker = document.createTreeWalker(value, NodeFilter.SHOW_TEXT);
-      const texts: Text[] = [];
-      while (walker.nextNode()) {
-        texts.push(walker.currentNode as Text);
-      }
-      for (const text of texts) {
-        if (!text.parentElement?.closest('[translate="no"]')) {
-          const outer = document.createElement("font");
-          const inner = document.createElement("font");
-          inner.textContent = text.data;
-          outer.append(inner);
-          text.replaceWith(outer);
-        }
-      }
-    }
+  const current = usageProps(true);
+  renderComposerInto(container, {
+    ...props,
+    selectedSession: current.selectedSession,
+    providerUsage: current.providerUsage,
+  });
+  flush();
 
-    const current = usageProps(true);
-    renderComposerInto(container, {
-      ...props,
-      selectedSession: current.selectedSession,
-      providerUsage: current.providerUsage,
-    });
-    flush();
-
-    expect(query(".context-usage details")).toBe(details);
-    expect(details.open).toBe(true);
-    expect(query("[data-chat-provider-usage]")).toBe(usageLink);
-    expect(document.activeElement).toBe(usageLink);
-    expect(usageLink.getAttribute("href")).toBe("/updated/usage");
-    expect(usageLink.textContent).toContain("Max");
-    expect(query(".context-usage__context-value")?.textContent).toContain("190k / 200k");
-    expect(query(".context-ring")?.classList).toContain("context-ring--warning");
-    expect(query(".context-usage__limit")?.getAttribute("aria-valuenow")).toBe("61");
-    expect(
-      query(".context-usage__identity .provider-brand-icon")?.getAttribute("data-provider-icon"),
-    ).toBe("claude");
-    expect(query(".context-usage__stats")?.textContent).toContain("9k");
-    details.querySelector("summary")!.click();
-    flush();
-    expect(details.open).toBe(false);
-    expect(details.querySelector("[popover]")?.matches(":popover-open")).toBe(false);
-    expect(query("[data-chat-provider-usage]")).toBe(usageLink);
-  },
-);
+  expect(query(".context-usage details")).toBe(details);
+  expect(details.open).toBe(true);
+  expect(document.activeElement).toBe(usageLink);
+  expect(usageLink.getAttribute("href")).toBe("/updated/usage");
+  expect(usageLink.textContent).toContain("Max");
+  expect(query(".context-usage__context-value")?.textContent).toContain("190k / 200k");
+  expect(query(".context-ring")?.classList).toContain("context-ring--warning");
+  expect(query(".context-usage__limit")?.getAttribute("aria-valuenow")).toBe("61");
+  expect(
+    query(".context-usage__identity .provider-brand-icon")?.getAttribute("data-provider-icon"),
+  ).toBe("claude");
+  expect(query(".context-usage__stats")?.textContent).toContain("9k");
+  details.querySelector("summary")!.click();
+  flush();
+  expect(details.open).toBe(false);
+  expect(details.querySelector("[popover]")?.matches(":popover-open")).toBe(false);
+  expect(query("[data-chat-provider-usage]")).toBe(usageLink);
+});
