@@ -124,6 +124,8 @@ export async function startQuotaProvider(
   tls?: { key: Buffer; cert: Buffer },
 ) {
   let phase: Phase = "healthy";
+  let proofToolThenLimit: "off" | "armed" | "tool-sent" | "done" = "off";
+  let proofToolName: string | undefined;
   let nextSuccessObserver: { observe: () => void; model: string; path: string } | undefined;
   let nextUsageHold: { arrived: Deferred<HeldProviderResponse>; released: Deferred } | undefined;
   let nextCatalogHold: { arrived: Deferred<HeldProviderResponse>; released: Deferred } | undefined;
@@ -498,7 +500,55 @@ export async function startQuotaProvider(
       websocket.on("error", (error) => errors.push(String(error)));
       websocket.on("message", (raw) => {
         const recorded = recordRequest(request, rawDataToString(raw), "websocket");
-        const events = exhausted() || phase === "revoked" ? [failure()] : successEvents(recorded);
+        let proofBody: Record<string, unknown> | undefined;
+        try {
+          proofBody = asRecord(JSON.parse(recorded.body ?? "null"));
+        } catch {}
+        const generating = proofBody?.type === "response.create" && proofBody.generate !== false;
+        let events: Array<Record<string, unknown>>;
+        if (generating && proofToolThenLimit === "armed") {
+          proofToolThenLimit = "tool-sent";
+          const tools = (Array.isArray(proofBody?.tools) ? proofBody.tools : []) as Array<{
+            name?: string;
+          }>;
+          const name =
+            tools.map((tool) => tool.name).find((n) => n === "exec_command" || n === "shell") ??
+            "exec_command";
+          proofToolName = name;
+          const callId = `call_${randomUUID().replaceAll("-", "")}`;
+          const item = {
+            type: "function_call",
+            id: `fc_${randomUUID().replaceAll("-", "")}`,
+            call_id: callId,
+            name,
+            arguments: JSON.stringify(
+              name === "shell" ? { command: ["echo", "proof"] } : { cmd: "echo proof" },
+            ),
+            status: "completed",
+          };
+          const id = `resp${randomUUID().replaceAll("-", "")}`;
+          const usage = {
+            input_tokens: 11,
+            output_tokens: 7,
+            total_tokens: 18,
+            input_tokens_details: { cached_tokens: 0 },
+          };
+          events = [
+            { type: "response.created", response: { id, status: "in_progress", output: [] } },
+            { type: "response.output_item.added", output_index: 0, item },
+            { type: "response.output_item.done", output_index: 0, item },
+            {
+              type: "response.completed",
+              response: { id, status: "completed", output: [item], usage },
+            },
+          ];
+        } else if (generating && proofToolThenLimit === "tool-sent") {
+          proofToolThenLimit = "done";
+          phase = "initial-exhaustion";
+          events = [failure()];
+        } else {
+          events = exhausted() || phase === "revoked" ? [failure()] : successEvents(recorded);
+        }
         for (const event of events) {
           responses.push({
             atMs: Date.now(),
@@ -535,6 +585,12 @@ export async function startQuotaProvider(
     heldUsageResponses,
     heldCatalogResponses,
     errors,
+    armToolThenLimit() {
+      proofToolThenLimit = "armed";
+    },
+    get proofToolState() {
+      return { state: proofToolThenLimit, tool: proofToolName };
+    },
     setPhase(next: Phase) {
       phase = next;
     },
@@ -704,6 +760,7 @@ export async function createQuotaResetFixture(
       OPENCLAW_TEST_MINIMAL_GATEWAY: "0",
       OPENCLAW_SKIP_PROVIDERS: undefined,
       OPENCLAW_AGENT_HARNESS_FALLBACK: "none",
+      ...(process.env.QUOTA_PROOF_CRON === "1" ? { OPENCLAW_SKIP_CRON: undefined } : {}),
     },
     config: {
       ...(controlUi
